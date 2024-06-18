@@ -1,0 +1,169 @@
+parameters: 
+  - name: buildJobs
+    displayName: 'Jobs to run to build artifact' 
+    type: jobList 
+  
+  - name: buildName 
+    displayName: 'Build Name'
+    type: string 
+
+  - name: sendNotification 
+    displayName: 'Create Jira and send notification'
+    type: boolean 
+    default: true 
+
+stages: 
+  ###################################################
+  # Run artifact build jobs
+  ################################################### 
+  - stage: BuildArtifact_${{ parameters.appName }}
+    displayName: Build artifact 
+    jobs: 
+      - ${{ parameters.buildJobs }}
+
+  ####################################################
+  # Send pipeline failure notification 
+  ####################################################
+  - ${{ parameters.sendNotification }}: 
+    - stage: FailureNotification 
+      displayName: Send pipeline failure notification 
+      condition: failed()
+      jobs: 
+        ######################################
+        # Create JIRA ticket
+        ######################################
+        - job: CreateTicket 
+          displayName: Create JIRA ticket 
+          variables: 
+            - group: jira_api 
+          steps: 
+            - script: | 
+                json=$(curl -s --insecure -X POST -u $(JIRA_USER):$(JIRA_TOKEN) \
+                -H "ContentT-Type: application/json" \ 
+                -d '{ 
+                  "fields": {
+                    "summary": "Pipeline failure: $(Build.DefinitionName)-$(Build.BuildId)", 
+                    "issuetype": {
+                       "id": "$(JIRA_BUG_ISSUE_TYPE)"
+                      },
+                      "project": {
+                        "id": "$(JIRA_GATEWAYS_PROJECT_ID)"
+                        }, 
+                        "description": "This pipeline failed: $(System.CollectionUrl)/$(System.TeamProject)/_build/result?buildId/=$(Build.BuildId)\n\npls fix",
+                        "components": [
+                        {
+                          "id": "${JIRA_ARCHITECTURE_COMPONENT_ID}"
+                          }
+                          ],
+                          "priority": {
+                            "id": "id"
+                            }
+                            }
+                          }' \
+                          "$(JIRA_V2_API_URL)/issue"
+
+                        ticketKey=$(echo $json | python -c "import sys, json; print(json.load(sys.stdin)['key'])" 2>/dev/null || echo none)
+                        echo "created $ticketKey"
+
+                        echo "##vso[task.setvariable variable=ticketKey;isoutput=true]$ticketKey"
+
+                        json=$(curl -s --insecure -X GET -u $(JIRA_USER):$(JIRA_TOKEN) \
+                        -H "Content-Type: application/json"
+                        "$(JIRA_V2_API_URL)/issue/$ticketKey")
+                        
+                        assignee=$(echo $json | python -c "import sys, json; \ 
+                        print(json.load(sys.stdin)['fields']['assignee']['displayName'])" 2>/dev/null || echo none)
+                        echo $assignee 
+
+                        echo "##vso[task.setvariable variable=assignee;isoutput=true]"$assignee""
+                      displayName: Create ticket 
+                      name: CreateTicket 
+
+        ####################################################
+        # Send GChat notification 
+        ####################################################
+        - job: SendNotification 
+          displayName: Send GChat notification 
+          dependsOn: 
+            - CreateTicket
+          pool: server 
+          variables:
+            ticketKey: $[ dependecies.CreateTicket.outputs['CreateTicket.ticketKey'] ]
+            assignee: $[ dependecies.CreateTicket.outputs['CreateTicket.assigne'] ]
+          steps: 
+            - task: InvokeRESTAP@1 
+              inputs: 
+                connectionType: 'connectedServiceName'
+                seviceConnection: 'GChat -GW Pipeline Status'
+                method: 'POST'
+                waitForCompletion: 'false'
+                body: | 
+                  {
+                  "cardsV2": | 
+                    {
+                      "cardId": "summary",
+                      "card": {
+                        "header": {
+                          "title": "Pipeline Failure", 
+                          "imageURL": "https://www.drivesupport.com/wp-content/uploads/2019/04/red-x-on-network-icon.png",
+                          "imageType": "CIRCLE"
+                        },
+                        "section": [
+                          {
+                            "header": "ADO Build",
+                            "collapsible": false,
+                            "widgets": [
+                              {
+                                "decoratedText": {
+                                  "icon": {
+                                    "knownIcon": "FLIGHT_DEPARTURE"
+                                  }, 
+                                  "text": "<b>$(Build.DefinitionName)-$(Build.BuildId)</b>",
+                                  "bottomLabel": "Branch: $(Build.SourceBranchName)", 
+                                  "button": {
+                                    "text": "View in ADO", 
+                                    "onClick": {
+                                      "openLink": {
+                                        "url": "$(System.CollectionUrl)/$(System.TeamProject)/_build/results?buildId=$(Build.BuildId)",
+                                      }
+                                     }
+                                   }
+                                 }
+                               }
+                             ]
+                           }, 
+                           {
+                             "header": "Resolution",
+                             "collapsible": false,
+                             "widgets": [
+                               {
+                                 "textParagraph": {
+                                   "text": "The following ticket has been created and assignged to $(assignee) to track the resolution of this pipeline falure:"
+                                 }
+                               },
+                               { 
+                                 "decoratedText": {
+                                   "icon": {
+                                     "knownIcon": "BOOKMARK"
+                                  },
+                                  "text": "<b>$(ticketKey)</b", 
+                                  "bootomLabel": "Pipeline failure: $(Build.DefinitionName)",
+                                  "button": {
+                                    "text": "View in JIRA", 
+                                    "onClick": {
+                                      "openLink": {
+                                        "url": "https://wexinc.atlassian.net/browse/$(ticketKey)",
+                                      }
+                                    }
+                                  }
+                                }
+                              }
+                            ]
+                          }
+                        ]
+                      }
+                    }
+                  ]
+                  }
+
+

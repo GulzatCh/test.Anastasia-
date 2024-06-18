@@ -1,0 +1,558 @@
+parameters:
+  - name: appName
+    displayName: "Name of the application"
+    type: string
+
+  - name: complianceScans
+    displayName: "Compliance scan parameters and flags"
+    type: object
+    default: 
+      appProfileName: ""
+      veracodeEnabled: false
+      mendEnabled: false
+
+  - name: scriptAndTamplateLinting
+    displayName: "Script and template linting and basic validation"
+    type: object
+    default:
+      bash: 
+        files: []
+        failPipelineOnError: false
+      cloudformation:
+        files: []
+        failPiepelineOnError: false
+  
+  - name: validateOpenApiDocs
+    displayName: "true to run the gradle task openApiValidate"
+    type: boolean 
+    default: false
+
+  - name: checkCodeStyle
+    displayName: "True to run gradle task verGJF"
+    type: boolean 
+    default: false
+
+  - name: buildJarGradleTask 
+    displayName: "Gradle task to use to build the jar (shadowJar | bootJar)"
+    type: string 
+    values: 
+      - shadowJar
+      - bootJar
+
+  - name: dockerImageConfig
+    displayName: "Parameters for building and publishing the Docker image"
+    type: object
+    default: 
+      repository: ""
+      dockerfile: ""
+      buildContextDir: ""
+
+  - name: temporaryComponentTestSteps
+    displayName: "Steps to run for component tests (TEMPORARY)"
+    type: stepList
+    default: []
+
+  - name: buildName
+    displayName: "Build Name"
+    type: string
+
+  - name: sendNotification
+    displayName: "Create Jira and send notification"
+    type: boolean
+    default: true
+
+stages:
+  - template: ../v2/standard-build.ado.yaml
+    parameters: 
+      buildName: ${{ parameters.buildName }}
+      sendNotofication: ${{ parameters.sendNotification}} 
+      buildJobs: 
+        - job: CheckParameters
+          displayName: Check build parameters
+          steps: 
+            - bash: |
+                FAIL=false
+                
+                DOCKER="dockerImageConfig"
+                if [ -z "$DOCKER_REPOSITORY" ]; then 
+                  echo "##vso[task.logissue type=error;]Missing template parameter \ "$DOCKER.repository\""
+                  FAIL=true
+                fi 
+
+                if [ -z "DOCKER_DOCKERFILE" ]; then 
+                  echo "##vso[task.logissue type=error;]Missing template parameter \ "$DOCKER.dockerfile\""
+                  FAIL=true
+                fi
+
+                if [ -z "DOCKER_BUILD_CONTEXT_DIR" ]; then 
+                  echo "##vso[task.logissue type=error;]Missing template parameter \ "$DOCKER.buildContextDir\""
+                  FAIL=true
+                fi
+
+                COMPLIANCE="complianceScans"
+                if [ "${COMPLIANCE_VERACODE,, }" = "true" ] || [ "${COMPLIANCE_MEND,,}" = "true" ]; then
+                  if [[ -z "$COMPLIANCE_PROFILE" ]]; then 
+                    echo "##vso[task.logissue type=error;]Missing template parameter \ "$COMPLIANCE.appProfileName\""
+                    FAIL=true
+                  fi
+                fi
+
+                if [ $FAIL = true ]; then 
+                  echo "##vso[task.complete result=Failed;]"
+                fi
+              env: 
+                DOCKER_REPOSITORY: ${{ parameters.dockerImageConfig.repository }}
+                DOCKER_DOCKERFILE: ${{ parameters.dockerImageConfig.dockerfile }}
+                DOCKER_BUILD_CONTEXT_DIR: ${{ parameters.dockerImageConfig.buildContextDir }}
+                COMPLIANCE_PROFILE: ${{ parameters.complianceScans.appProfileName }}
+                COMPLIANCE_VERACODE: ${{ parameters.complianceScans.veracodeEnabled }}
+                COMPLIANCE_MEND: ${{ parameters.complianceScans.mendEnabled }}
+              displayName: Check for required parameters
+        
+        - job: CheckInfrastructure
+          dependsOn: CheckParameters
+          displayName: Validate infrastructure files
+          variables: 
+            BASH_FILES:  ${{ convertToJson(parameters.scriptAndTemplateLinting.bash.files) }}
+            CFN_FILES: ${{ convertToJson(parameters.scriptAndTemplateLinting.cloudformation.files) }}
+          steps: 
+            #########################################################
+            # Validate bash scripts
+            #########################################################
+            - ${{ if parameters.scriptAndTemplateLinting.bash }}:
+                - ${{ if gt(length(parameters.scriptandTemplateLinting.bash.files), 0) }}:
+                    - script: |
+                        FAILURE=false
+
+                        files=$(echo "$BASH_FILES" | jq -r '.[]')
+                        mkdir $(Build.StagingDirectory)/bash 
+                        for f in $files: do 
+                          docker run --rm -v $(pwd):/mnt koalaman/shellcheck:stable $f
+                          RESULT=$?
+                          if [[ "$RESULT" -ne 0 ]]; then 
+                            if [ "${FAIL_ON_ERROR,,}" = "true" ]; then 
+                              echo "##vso[task.logissue type=error;]Bash script $f failed validation; see logs"
+                              FAILURE=true 
+                            else 
+                              echo "##vso[task.logissue type=warning;]Bash script $f failed validation; see logs"
+                            fi 
+                          fi 
+                        done 
+
+                        if [ $FAILURE =true ]; then 
+                          echo "##vso[task.complete result=Failed;]"
+                        fi 
+                      env: 
+                        FAIL_ON_ERROR: ${{ parameters.scriptAndTemplateLinting.bash.failPipelineOnError }}
+                      displayName: Lint bash scripts
+
+            ############################################################
+            # Validate CloudFormation templates
+            ############################################################ 
+            - ${{ if (parameters.scriptAndTemplateLinting.cloudformation }}: 
+               - ${{ if gt(length(parameters.scriptAndTemplateLinting.cloudformation.files), 0) }}:
+                   - script: |
+                       FAILURE=false 
+
+                       files=$(echo "$CFN_FILES" |  jq -r '.[]')
+                       mkdir $(Build.StagingDirectory)/cfn
+                       for f in $files; do 
+                         docker run --rm -v $(pwd):data alpine/cfn-lint $f 
+                         RESULT=$?
+                         if [[ "$RESULT" -ne 0 ]]; then 
+                           if [ "${FAIL_ON_ERROR,,}" = "true" ]; then 
+                             echo "##vso[task.logissue type=error;]CloudFormation template $f failed validation; see logs"
+                             FAILURE=true 
+                           else 
+                             echo "##vso[task.logissue type=warning;]CloudFormation template $f failed validation; see logs"
+                           fi 
+                         fi 
+                        done 
+
+                        if [ $FAILURE = true ]; then 
+                          echo "##vso[task.complete result=Failed;]"
+                        fi 
+                       env: 
+                         FAIL_ON_ERROR: ${{ (parameters.scriptAndTemplateLinting.cloudformation.failPipelineOnError }}
+                       displayName: Validate CloudFormation template
+
+            ########################################################
+            # Perform Mend scan
+            ########################################################
+            - ${{ if parameters.complianceScans.mendEnabled }}:
+                - job: Mend_Scan 
+                  displayName: Perform Mend scan 
+                  dependsOn: CheckInfrastructure 
+                  continueOnError: true 
+                  container: corretto 
+                  variables: 
+                    GRADLE_USER_HOME: $(Pipeline.Workspace)/.gradle 
+                    GRADLE_CLI_OPTS: >- 
+                  steps: 
+                    - task: Cache@2
+                      displayName: Configure gradle caching 
+                      inputs: 
+                        key: 'gradle | "$(Agent.OS)" | **/build.gradle | **/gradle.properties'
+                        restoreKeys: |
+                          gradle | "$(Agent.OS)"
+                          gradle 
+                        path: $(GRADLE_USER_HOME)
+
+                    - script: | 
+                        echo Downloading WhiteSource Unified Agent 
+                        sudo mkdir -p "/_w/whitesourse_agent"
+                        sudo chmod 777 /_w/whitesourse_agent/
+                        pushd /_w/whitesourse_agent/
+                        curl -LJD https://unified-agent.s3.amazonaws.com/wss-unified-agent.jar
+                        curl -LJD https://unified-agent.s3.amazonaws.com/wss-unified-agent.jar.sha1
+                        if [[ "$(curl -sL https://unified-agent.s3.amazonaws.com/wss-unified-agent.jar.sha256)" != "$(sha256sub wss-unified-agent.jar)" ]]; then 
+                          echo "Integrity Check failed"
+                        else 
+                          echo "Integrity Check Passed"
+                        fi 
+                      displayName: Fetch whitesource agent
+
+                    - task: WhiteSource@21
+                      displayName: WhiteSource/Mend Scan 
+                      inputs: 
+                        cwd: "$(System.DefaultWorkingDirectory)"
+                        projectName: ${{ parameters.complianceScans.appProfileName }} 
+                      continueOnError: true 
+                    
+                    - script: ./gradlew --stop 
+                      displayName: Stop Gradle Daemon 
+                      condition: always() 
+
+            #######################################################
+            # Perform Veracode scan 
+            #######################################################            
+            - ${{ if parameters.complianceScans.veracodeEnabled }}: 
+                - job: Veracode_Scan 
+                  displayName: Perform Veracode scan 
+                  dependsOn:
+                    - buildJar
+                    - CheckInfrastructure
+                  continueOnError: true 
+                  container: corretto 
+                  variables: 
+                    artifactVersion: $[ dependencies.BuildJar.outputs['TagReleaseVersion.artifactVersion'] ]
+                    GRADLE_USER_HOME: $(Pipeline.Workspace)/.gradle 
+                    GRADLE_CLI_OPTS: >-
+                      --build-cache 
+                  steps: 
+                    - task: Cache@2 
+                      displayName: Configure gradle caching 
+                      inputs:
+                        key: 'gradle | "$(Agent.OS)" | **/build.gradle | **/gradle.properties'
+                        restoreKeys: | 
+                          gradle | "$(Agent.OS)"
+                          gradle
+                        path: $(GRADLE_USER_HOME)
+
+                    - task: Gradle@3 
+                      displayName: Build sources and run unit tests 
+                      inputs: 
+                        gradleWrapperFile: "gradlew"
+                        options: $(GRADLE_CLI_OPTS)
+                        tasks: "jar"
+                    
+
+                    - script: ./gradlew --stop 
+                      displayName: Stop gradle Daemon 
+                      condition: always()
+
+                    - script: | 
+                        cd $(System.DefaultWorkingDirectory)/build/libs/
+                        tar -zcf veracode.tgz *.jar
+                        mv veracode.tgz $(Build.ArtifactStagingDirectory)/veracode.tgz
+                      displayName: Zip jar file 
+
+                    - publish: "$(Build.ArtifactStagingDirectory)/veracode.tgz"
+                      displayName: Publish jar file 
+                      artifact: jar 
+
+                    - task: Veracode@3
+                      displayName: "Transmit and Scan"
+                      inputs:
+                        ConnectionDetailsSelection: "Endpoint"
+                        AnalisService: "Veracode" 
+                        veracodeAppProfile: ${{ parameters.complianceScans.appProfileName }}
+                        version: "(artifactVersion)"
+                        filepath: $(Build.ArtifactStagingDirectory)/veracode.tgz'
+                        createSanBox: false
+                        createProfile: false 
+                        importResults: true 
+                        maximumWaitTime: "1440"
+                        optargs: >-
+                          -lifecyclestage DeployedInProductionAndActivelyDeveloped 
+
+            - job: BuildJar
+              displayName: Build and test JAR 
+              container: corretto
+              dependsOn: CheckInfrastructure
+              variables: 
+                GRADLE_USER_HOME: ${(Pipeline.Workspace}/gradle 
+                GRADLE_CLI_OPTS: >- 
+                  --build-cache
+              steps: 
+                ##################################################
+                # Check out source code, persist credentials for release (only on main?)
+                ##################################################
+                - checkout: self 
+                  displayName: Check out source code 
+                  persistCredentials: true 
+
+                ##################################################
+                # Configure gradle caching 
+                ##################################################
+                - task: Cache@2 
+                  displayName: Configure gradle caching 
+                  inputs: 
+                    key: 'gradle | "$(Agent.OS)" | **/build.gradle | **/gradle.properties'
+                    restoreKeys: | 
+                      gradle | "$(Agent.OS)"
+                      gradle 
+                    path: $(GRADLE_USER_HOME)
+
+                ###########################################################
+                # Validate OpenAPI documents via Gradle openApiValidate 
+                ###########################################################
+                - ${{ if parameters.validateOpenApiDocs }}:
+                    - task: Gradle#3
+                      displayName: Check OpenApi spec document 
+                      inputs: 
+                        gradleWrapperFile: "gradlew"
+                        options: $(GRADLE_CLI_OPTS)
+                        tasks: "openApiValidate"
+                        publishJUnitResults: false 
+                        sqAnalysisEnalbled: false 
+                        spotBugsAnalysis: false 
+
+                ###############################################################
+                # Check code style via Gradle verGJF 
+                ############################################################### 
+                - ${{ if parameters.checkCodeStyle }}:
+                    - task: Gradle@3
+                      displayName: Check code style 
+                      inputs: 
+                        gradleWrapperFile: "gradlew"
+                        tasks: "verGJF"
+                        options: $(GRADLE_CLI_OPTS)
+                        publishJUnitResults: false 
+                        sqAnalysisEnalbled: false 
+                        spotBugsAnalysis: false 
+
+                ##################################################################
+                # Build, test, and publish test results
+                ##################################################################
+                - task: Gradle@3 
+                  displayName: Build sources and run unit tests
+                  inputs: 
+                    gradleWrapperFile: "gradlew"
+                    tasks: "build test jacocoTestReport"
+                    options: $(GRADLE_CLI_OPTS) --info 
+                    publishJUnitResults: true 
+                    testResultsFiles: "**/test/TEST-*.xml"
+                    testRunTitle: "Unit Tests" 
+                    sqAnalysisEnalbled: false 
+                    spotBugsAnalysis: false 
+                - task: PublishCodeCoverageResults@1 
+                  displayName: Publish code coverage results 
+                  inputs: 
+                    codeCoverageTool: "JaCoCo"
+                    summaryFileLocation: "build/reports/jacoco/test/jacocoTestReport.xml"
+                    pathToSources: "scr/main/java"
+                    reportDirectory: "build/reports/jacoco/test/html"
+                    additionalCodeCoverageFiles: "build/jacoco/test.exec"
+                    failCoverageEmpty: true 
+
+                ###############################################################
+                # Realease new version
+                ###############################################################
+                - task: CmdLine@2 
+                  inputs: 
+                    script: |
+                      git fetch --tags --unshallow 
+
+                      ./gradlew release \ 
+                        -Prelease.overriddenBranchName=$(Build.SourceBranch) \ 
+                        -Prelease.disableChecks \
+                        -Prelease.pushTagsOnly \
+                        ; export  code=$?
+                      
+                      version=$(./gradlew currentVersion -Prelease.overriddenBranchName=$Build.SourceBranch) | grep "Project version: " | cut -c 18-)
+
+                      echo "Current version: $version"
+                      echo "##vso[task.setvariable variable=artifactVersion;isoutput=true]$version"
+                      echo "##vso[build.updatebuildnumber]$(Build.DefinitionName)-$(Build.BuildId)-$version"
+
+                      if [ "$code" -eq "0" ]; then 
+                          echo "Gradle task succeeded."
+                      else 
+                          echo "Gradle task failed. Code: "$code"
+                          exit 1 
+                      fi 
+
+                  displayName: Release new version 
+                  name: TagReleaseVersion 
+
+                #####################################################################
+                # Build JAR
+                #####################################################################
+                - task: Gradle#3 
+                  displayName: Create JAR
+                  inputs: 
+                    gradleWrapperFile: "gredlew"
+                    tasks: ${{ parameters.buildJarGradleTask }}
+                    options: $(GRADLE_CLI_OPTS)
+                    publishJUnitResults: false 
+                    sqAnalysisEnalbled: false 
+                    spotBugsAnalysis: false 
+
+                - script: ./gradlew --stop 
+                  displayName: Stop Gradle Daemon 
+                  condition: always()
+
+                - task: PublishPipelineArtifact@1 
+                  displayName: Publish JAR to pipeline 
+                  inputs: 
+                    targetPath: "build/libs"
+                    artifact: "${{ parameters.appName }}-jar"
+                    publishLocation: "pipeline"
+                    
+        - job: DockerImage 
+          displayName: Build and test Docker image 
+          dependsOn: BuildJar 
+          variables: 
+            artifactVersion: $[ dependencies.BuildJar.outputs['TagReleaseVersion.artifactVersion'] ]
+          steps: 
+            - task: DownloadPipelineArtifact@2 
+              displayName: Download JAR from pipeline 
+              inputs: 
+                buildtype: "current"
+                artifactName: "${{ parameters.appName }}-jar"
+                targetPath: "build/libs"
+            
+            #############################################################
+            # Build app Docker image
+            #############################################################
+            - task: Docker@2 
+              displayName: Build app Docker image 
+              inputs: 
+                containerRegistry: "Container Registry"
+                repository: ${{ parameters.dockerImageConfig.dockerfile }}
+                command: "build"
+                Dockerfile: ${{ parameters.dockerImageConfig.dockerfile }}
+                buildContext: ${{ parameters.dockerImageConfig.buildContextDir }}
+                tags: "$(artifactVersion)"
+
+            ###############################################################
+            # Run component tests and publish results
+            ###############################################################
+            - ${{ parameters.temporaryComponentTestSteps }}
+
+            ###############################################################
+            # Save and publish Docker image to pipeline 
+            ###############################################################
+            - script: | 
+                docker save -0 ${{ parameters.appName }}-docker.tar $REGISTRY_URL/$REPO:$(artifactVerion)
+              env: 
+                REGISTRY_URL: wexgateways.azurecr.io
+                REPO: ${{ parameters.dockerImageConfig.repository }}
+              displayName: Save app Docker image
+            - task: PublishBuildArtifacts@1 
+              displayName: Publish Docker image to pipeline
+              inputs: 
+                PathtoPublish: ${{ parameters.appName }}-docker.tar 
+                ArtifactName: ${{ parameters.appName }}-docker-image
+                publishLocatoin: "Container" 
+
+            #############################################################
+            # Push Docker image to registry 
+            #############################################################
+            - task: Docker@2 
+              displayName: Push Docker image to registry 
+              inputs: 
+                containerRegistry: "Container Registry"
+                repository: ${{ parameters.docker.ImageConfig.repository }}
+                command: "push"
+                tags: "${artifactVersion}"
+
+            - script: | 
+                docker image rm $REGISTRY_URL/$REPO:${artifactVersion}
+              env: 
+                REGISTRY_URL: wexgateways.azurecr.io
+                REPO: ${{ parameters.docker.ImageConfig.repository }}
+              displayName: Clean up local Docker image 
+
+            ###############################################################
+            # Trigger ag-core merge job
+            ###############################################################
+            - ${{ if and(eq(variables['Build.SourceBranch'], 'refs/heads/main'), eq(parameters.appName, 'ag-core')) }}: 
+                - job: TriggerJenkinsJob
+                  timeoutInMinutes: 90 
+                  displayName: "[legacy] Run ag-core deploy and test jobs"
+                  dependsOn: 
+                    - BuildJar
+                    - DockerImage 
+                  variables: 
+                    - group: jenkins_api
+                    - name: artifactVersion 
+                      value: $[ dependencies.BuildJar.outputs['TagReleaseVersion.artifactVersion'] ]
+                  steps: 
+                    - task: JenkinsQueueJob@2 
+                      displayName: Deploy EC2 to QFT 
+                      inputs: 
+                        serverEndpoint: "Jenkins - authgateway - NonProd"
+                        jobName: "PS-AG-Deploy/ps-ag-core/main"
+                        capturePipeline: true 
+                        captureConsole: true 
+                        isParameterizedJob: true 
+                        jobParameters: | 
+                          VERSION=$(artifactVerion)
+                          AWS_REGION=us-east-1
+                          TYPE=ec2 
+                          ENVIRONMENT=dev 
+                          ENVIRONMENT_NAME=qft 
+                        failOnUnstableResult: true 
+                    - task: JenkinsQueueJob@2 
+                      displayName: Deploy Fargate to QFT 
+                      inputs: 
+                        serverEndpoint: "Jenkins -authgateway -NonProd"
+                        jobName: "PS-AG-Deploy/ps-ag-core/main"
+                        captureConsole: true 
+                        capturePipeline: true 
+                        isParameterizedJob: true 
+                        jobParameters: | 
+                          VERSION:$(artifactVersion) 
+                          AWS_REGION=us-east-1 
+                          TYPE=fargate 
+                          ENVIRONMENT=dev 
+                          ENVIRONMENT_NAME=qft 
+                        failOnUnstableResult: true 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                
+
+
+
+
+       
+
+                
+            
+
+     
